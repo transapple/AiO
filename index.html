@@ -3749,12 +3749,18 @@
         if (profileError) throw profileError;
         if (!profile || !profile.school_id) throw new Error("This account isn't linked to a school yet.");
 
-        const { data: term } = await client
+        const { data: term, error: termError } = await client
           .from('terms')
           .select('id, name, academic_year_id, start_date, end_date')
           .eq('school_id', profile.school_id)
           .eq('is_current', true)
           .maybeSingle();
+        if (termError) {
+          // Don't let a bad current-term lookup fail silently — term-dependent modules
+          // (Fees, Examinations, Invoices, Enrollments, Results) depend on this being
+          // populated, and a swallowed error here is indistinguishable from "no term set yet".
+          console.warn('Could not resolve the current term:', termError.message || termError);
+        }
 
         return { user, profile, schoolId: profile.school_id, school: profile.schools, currentTerm: term || null };
       })();
@@ -5270,11 +5276,20 @@
     if (error) throw error;
     return (data || []).map(r => Object.assign({ _id: r.id }, dbRowToStudent(r)));
   }
+  // studentRowToDb leaves payload.photo_url === undefined specifically as a "pending
+  // upload" sentinel (set when s_photo is a data: URL still being uploaded above).
+  // Only that sentinel case should be dropped from the payload. photo_url === null
+  // means the person explicitly cleared the photo and must be sent through as null;
+  // a plain string means it's unchanged and is harmless to resend.
+  function applyUploadedPhoto(payload, uploadedUrl){
+    if (uploadedUrl) payload.photo_url = uploadedUrl;
+    else if (payload.photo_url === undefined) delete payload.photo_url;
+  }
   async function studentsCreateRow(values){
     const ctx = await window.AiOSchoolContext.get();
     const uploadedUrl = await studentUploadPhotoIfNeeded(ctx.schoolId, values);
     const payload = Object.assign({}, studentRowToDb(values), { school_id: ctx.schoolId });
-    if (uploadedUrl) payload.photo_url = uploadedUrl; else delete payload.photo_url;
+    applyUploadedPhoto(payload, uploadedUrl);
     const { data, error } = await window.supabaseClient.from('students').insert(payload).select(STUDENTS_SELECT).single();
     if (error) throw error;
     return Object.assign({ _id: data.id }, dbRowToStudent(data));
@@ -5283,7 +5298,7 @@
     const ctx = await window.AiOSchoolContext.get();
     const uploadedUrl = await studentUploadPhotoIfNeeded(ctx.schoolId, values);
     const payload = studentRowToDb(values);
-    if (uploadedUrl) payload.photo_url = uploadedUrl; else delete payload.photo_url;
+    applyUploadedPhoto(payload, uploadedUrl);
     const { data, error } = await window.supabaseClient.from('students').update(payload).eq('id', id).select(STUDENTS_SELECT).single();
     if (error) throw error;
     return Object.assign({ _id: data.id }, dbRowToStudent(data));
@@ -5352,6 +5367,56 @@
   // their total payments against what Fee Structure (Settings > Academic Setup) bills
   // their class, the same cross-reference recalcFeesHealth already does per class.
   const PAYMENTS_SELECT = 'id, amount, method, paid_at, student_id, students(full_name, classes(name))';
+  // The `invoices` table is read all over the dashboards and AI insights (totalBilled,
+  // totalOutstanding, overdue accounts, etc.) but nothing ever wrote to it — Fees tracking
+  // has always run on the separate fee_structure + payments comparison instead. This keeps
+  // one invoice row per (student, current term) in sync with that same math, so those
+  // dashboards stop being permanently empty. Best-effort: a sync failure must never block
+  // a payment from saving.
+  async function syncInvoiceForStudent(ctx, studentId, classId, termId){
+    try {
+      const useTermId = termId || (ctx.currentTerm && ctx.currentTerm.id);
+      if (!useTermId || !classId) return; // nothing to reconcile against yet
+      const [feeRes, payRes, invRes] = await Promise.all([
+        window.supabaseClient.from('fee_structure').select('amount').eq('school_id', ctx.schoolId).eq('term_id', useTermId).eq('class_id', classId),
+        window.supabaseClient.from('payments').select('amount').eq('school_id', ctx.schoolId).eq('student_id', studentId),
+        window.supabaseClient.from('invoices').select('id').eq('school_id', ctx.schoolId).eq('student_id', studentId).eq('term_id', useTermId).maybeSingle()
+      ]);
+      if (feeRes.error) throw feeRes.error;
+      if (payRes.error) throw payRes.error;
+      if (invRes.error) throw invRes.error;
+      const totalAmount = (feeRes.data || []).reduce((s, r) => s + Number(r.amount || 0), 0);
+      const totalPaid = (payRes.data || []).reduce((s, r) => s + Number(r.amount || 0), 0);
+      const balance = Math.max(0, totalAmount - totalPaid);
+      let status = 'open';
+      if (totalAmount > 0 && balance <= 0) status = 'paid';
+      else if (totalPaid > 0) status = 'partial';
+      const payload = { school_id: ctx.schoolId, student_id: studentId, term_id: useTermId, total_amount: totalAmount, balance, status };
+      if (invRes.data && invRes.data.id) {
+        const { error } = await window.supabaseClient.from('invoices').update(payload).eq('id', invRes.data.id);
+        if (error) throw error;
+      } else if (totalAmount > 0) {
+        // Only create an invoice once something has actually been billed this term.
+        const { error } = await window.supabaseClient.from('invoices').insert(payload);
+        if (error) throw error;
+      }
+    } catch (e) {
+      console.warn('Could not sync invoice for student:', e && e.message);
+    }
+  }
+  // Fee Structure edits bill a whole class at once, so every student currently in that
+  // class/term needs their invoice recalculated — not just whoever's payment triggered a
+  // sync last. Called after Fee Structure rows are created, edited, deleted, or restored.
+  async function resyncInvoicesForClassTerm(ctx, classId, termId){
+    try {
+      if (!classId || !termId) return;
+      const { data, error } = await window.supabaseClient.from('students').select('id').eq('school_id', ctx.schoolId).eq('class_id', classId);
+      if (error) throw error;
+      await Promise.all((data || []).map(s => syncInvoiceForStudent(ctx, s.id, classId, termId)));
+    } catch (e) {
+      console.warn('Could not resync invoices for class:', e && e.message);
+    }
+  }
   function billedForClass(cls){
     const structureRows = (ACAD_DATA['fee-structure'] && ACAD_DATA['fee-structure'].rows) || [];
     return structureRows.filter(r => r.class === cls).reduce((sum, r) => sum + (parseNum(r.amount) || 0), 0);
@@ -5396,11 +5461,16 @@
     };
     const { data, error } = await window.supabaseClient.from('payments').insert(payload).select(PAYMENTS_SELECT).single();
     if (error) throw error;
+    syncInvoiceForStudent(ctx, student._id, acadFindIdByName('classes', student.s_class));
     return Object.assign({ _id: data.id }, dbRowToPayment(data));
   }
   async function paymentsUpdateRow(id, values){
+    const ctx = await window.AiOSchoolContext.get();
     const student = findStudentByName(values.fp_student);
     if (!student) throw new Error('Could not find that student in Student Records \u2014 check the name matches exactly.');
+    // If this payment is being reassigned to a different student, both students' invoice
+    // totals need reconciling — not just the new one.
+    const { data: previous } = await window.supabaseClient.from('payments').select('student_id').eq('id', id).maybeSingle();
     const payload = {
       student_id: student._id,
       amount: values.fp_amount ? Number(values.fp_amount) : 0,
@@ -5409,11 +5479,22 @@
     };
     const { data, error } = await window.supabaseClient.from('payments').update(payload).eq('id', id).select(PAYMENTS_SELECT).single();
     if (error) throw error;
+    syncInvoiceForStudent(ctx, student._id, acadFindIdByName('classes', student.s_class));
+    if (previous && previous.student_id && previous.student_id !== student._id) {
+      const prevCache = (window.__AiOStudentsCache || []).find(r => r._id === previous.student_id);
+      if (prevCache) syncInvoiceForStudent(ctx, previous.student_id, acadFindIdByName('classes', prevCache.s_class));
+    }
     return Object.assign({ _id: data.id }, dbRowToPayment(data));
   }
   async function paymentsDeleteRow(id){
+    const ctx = await window.AiOSchoolContext.get();
+    const { data: previous } = await window.supabaseClient.from('payments').select('student_id').eq('id', id).maybeSingle();
     const { error } = await window.supabaseClient.from('payments').delete().eq('id', id);
     if (error) throw error;
+    if (previous && previous.student_id) {
+      const prevCache = (window.__AiOStudentsCache || []).find(r => r._id === previous.student_id);
+      if (prevCache) syncInvoiceForStudent(ctx, previous.student_id, acadFindIdByName('classes', prevCache.s_class));
+    }
   }
   function paymentTotalsByStudent(rows){
     const totals = {};
@@ -5599,12 +5680,22 @@
               refreshTable();
               syncAcademicSetupToApp(key);
               acadDeleteRow(key, rowId).then(() => {
+                if (key === 'fee-structure'){
+                  window.AiOSchoolContext.get().then(ctx => {
+                    resyncInvoicesForClassTerm(ctx, acadFindIdByName('classes', row.class), acadFindIdByField('terms', 'term', row.term));
+                  });
+                }
                 addToTrash(label, data.title, () => {
                   acadCreateRow(key, row).then(newRow => {
                     const insertAt = Math.min(idx, data.rows.length);
                     data.rows.splice(insertAt, 0, newRow);
                     refreshTable();
                     syncAcademicSetupToApp(key);
+                    if (key === 'fee-structure'){
+                      window.AiOSchoolContext.get().then(ctx => {
+                        resyncInvoicesForClassTerm(ctx, acadFindIdByName('classes', newRow.class), acadFindIdByField('terms', 'term', newRow.term));
+                      });
+                    }
                   }).catch(e => showToast('Could not restore: ' + (e && e.message ? e.message : 'please try again')));
                 });
                 showToast('Deleted \u2014 moved to Trash');
@@ -5648,6 +5739,7 @@
         saveBtn.textContent = isEdit ? 'Saving\u2026' : 'Adding\u2026';
         const task = isEdit ? acadUpdateRow(key, rowId, values) : acadCreateRow(key, values);
         task.then(savedRow => {
+          const previousRow = isEdit ? Object.assign({}, data.rows[editingIdx]) : null;
           let savedIdx;
           if (isEdit){
             data.rows[editingIdx] = savedRow;
@@ -5657,6 +5749,16 @@
             data.rows.unshift(savedRow);
             savedIdx = 0;
             showToast('Entry added');
+          }
+          if (key === 'fee-structure'){
+            window.AiOSchoolContext.get().then(ctx => {
+              const newClassId = acadFindIdByName('classes', savedRow.class);
+              const newTermId = acadFindIdByField('terms', 'term', savedRow.term);
+              resyncInvoicesForClassTerm(ctx, newClassId, newTermId);
+              if (previousRow && (previousRow.class !== savedRow.class || previousRow.term !== savedRow.term)){
+                resyncInvoicesForClassTerm(ctx, acadFindIdByName('classes', previousRow.class), acadFindIdByField('terms', 'term', previousRow.term));
+              }
+            });
           }
           closeForm();
           refreshTable();
